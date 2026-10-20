@@ -1,0 +1,812 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Timers;
+using System.Windows.Forms;
+
+namespace PersistentStopwatch
+{
+    // Data model for a single stopwatch
+    public class StopwatchData
+    {
+        public string Name { get; set; } = "";
+        public long ElapsedTicks { get; set; }
+        public DateTime? StartTime { get; set; }
+        public bool IsRunning { get; set; }
+        public bool IsPersistent { get; set; }
+        public List<LapTime> Laps { get; set; } = new List<LapTime>();
+        public DateTime CreatedAt { get; set; }
+        public DateTime LastUsed { get; set; }
+    }
+
+    // Data model for lap/flag times
+    public class LapTime
+    {
+        public DateTime Timestamp { get; set; }
+        public long ElapsedTicks { get; set; }
+        public string Note { get; set; } = "";
+    }
+
+    // Main persistent stopwatch class
+    public class PersistentStopwatch
+    {
+        private StopwatchData _data;
+        private System.Timers.Timer _updateTimer;
+        private readonly string _dataFile;
+
+        public event EventHandler<TimeSpan>? TimeUpdated;
+        public event EventHandler<LapTime>? LapAdded;
+
+        public string Name => _data.Name;
+        public bool IsRunning => _data.IsRunning;
+        public TimeSpan Elapsed => GetCurrentElapsed();
+        public List<LapTime> Laps => _data.Laps;
+        public DateTime CreatedAt => _data.CreatedAt;
+        public DateTime LastUsed => _data.LastUsed;
+
+        public PersistentStopwatch(string name, string dataDirectory)
+        {
+            _dataFile = Path.Combine(dataDirectory, $"{SanitizeFileName(name)}.json");
+            _data = LoadData(name);
+            
+            // Setup update timer (100ms for smooth UI updates)
+            _updateTimer = new System.Timers.Timer(100);
+            _updateTimer.Elapsed += OnTimerElapsed;
+            
+            if (_data.IsRunning)
+            {
+                _updateTimer.Start();
+            }
+        }
+
+
+        private void OnTimerElapsed(object? sender, ElapsedEventArgs e)
+        {
+            if (_data.IsRunning)
+            {
+                TimeUpdated?.Invoke(this, GetCurrentElapsed());
+            }
+        }
+
+        private TimeSpan GetCurrentElapsed()
+        {
+            var totalTicks = _data.ElapsedTicks;
+            
+            if (_data.IsRunning && _data.StartTime.HasValue)
+            {
+                totalTicks += (DateTime.Now - _data.StartTime.Value).Ticks;
+            }
+            
+            return new TimeSpan(totalTicks);
+        }
+
+        public void Start()
+        {
+            if (!_data.IsRunning)
+            {
+                _data.IsRunning = true;
+                _data.StartTime = DateTime.Now;
+                _data.LastUsed = DateTime.Now;
+                _updateTimer.Start();
+                SaveData();
+            }
+        }
+
+        public void Stop()
+        {
+            if (_data.IsRunning && _data.StartTime.HasValue)
+            {
+                _data.ElapsedTicks += (DateTime.Now - _data.StartTime.Value).Ticks;
+                _data.IsRunning = false;
+                _data.StartTime = null;
+                _data.LastUsed = DateTime.Now;
+                _updateTimer.Stop();
+                SaveData();
+            }
+        }
+
+        public void Reset()
+        {
+            _data.ElapsedTicks = 0;
+            _data.IsRunning = false;
+            _data.StartTime = null;
+            _data.LastUsed = DateTime.Now;
+            _data.Laps.Clear();
+            _updateTimer.Stop();
+            SaveData();
+        }
+
+        public LapTime AddLap(string note = "")
+        {
+            var lap = new LapTime
+            {
+                Timestamp = DateTime.Now,
+                ElapsedTicks = GetCurrentElapsed().Ticks,
+                Note = note
+            };
+            
+            _data.Laps.Add(lap);
+            _data.LastUsed = DateTime.Now;
+            SaveData();
+            
+            LapAdded?.Invoke(this, lap);
+            return lap;
+        }
+
+        private StopwatchData LoadData(string name)
+        {
+            if (File.Exists(_dataFile))
+            {
+                try
+                {
+                    var json = File.ReadAllText(_dataFile);
+                    var data = JsonSerializer.Deserialize<StopwatchData>(json);
+                    if (data != null)
+                    {
+                        // Reset running state on load (computer was off)
+                        if (data.IsRunning && data.StartTime.HasValue)
+                        {
+                            // Add the time that passed before shutdown
+                            data.ElapsedTicks += (DateTime.Now - data.StartTime.Value).Ticks;
+                        }
+                        data.IsRunning = false;
+                        data.StartTime = null;
+                        return data;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error loading data for {name}: {ex.Message}");
+                }
+            }
+
+            // Create new stopwatch data
+            return new StopwatchData
+            {
+                Name = name,
+                CreatedAt = DateTime.Now,
+                LastUsed = DateTime.Now
+            };
+        }
+
+        private void SaveData()
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(_data, new JsonSerializerOptions 
+                { 
+                    WriteIndented = true 
+                });
+                
+                Directory.CreateDirectory(Path.GetDirectoryName(_dataFile)!);
+                File.WriteAllText(_dataFile, json);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error saving data for {_data.Name}: {ex.Message}");
+            }
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+        }
+
+        public void Dispose()
+        {
+            _updateTimer?.Dispose();
+            if (_data.IsRunning)
+            {
+                Stop();
+            }
+        }
+    }
+
+    // Manager class for multiple stopwatches
+    public class StopwatchManager
+    {
+        private readonly Dictionary<string, PersistentStopwatch> _stopwatches;
+        private readonly string _dataDirectory;
+
+        public IEnumerable<PersistentStopwatch> Stopwatches => _stopwatches.Values;
+
+        public StopwatchManager(string dataDirectory = "StopwatchData")
+        {
+            _dataDirectory = dataDirectory;
+            _stopwatches = new Dictionary<string, PersistentStopwatch>();
+            LoadExistingStopwatches();
+        }
+
+        private void LoadExistingStopwatches()
+        {
+            if (!Directory.Exists(_dataDirectory))
+                return;
+
+            foreach (var file in Directory.GetFiles(_dataDirectory, "*.json"))
+            {
+                try
+                {
+                    var json = File.ReadAllText(file);
+                    var data = JsonSerializer.Deserialize<StopwatchData>(json);
+                    if (data != null && !string.IsNullOrEmpty(data.Name))
+                    {
+                        var stopwatch = new PersistentStopwatch(data.Name, _dataDirectory);
+                        _stopwatches[data.Name] = stopwatch;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error loading stopwatch from {file}: {ex.Message}");
+                }
+            }
+        }
+
+        public PersistentStopwatch CreateStopwatch(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("Stopwatch name cannot be empty");
+
+            if (_stopwatches.ContainsKey(name))
+                throw new ArgumentException($"Stopwatch '{name}' already exists");
+
+            var stopwatch = new PersistentStopwatch(name, _dataDirectory);
+            _stopwatches[name] = stopwatch;
+            return stopwatch;
+        }
+
+        public PersistentStopwatch? GetStopwatch(string name)
+        {
+            return _stopwatches.TryGetValue(name, out var stopwatch) ? stopwatch : null;
+        }
+
+        public bool DeleteStopwatch(string name)
+        {
+            if (_stopwatches.TryGetValue(name, out var stopwatch))
+            {
+                stopwatch.Dispose();
+                _stopwatches.Remove(name);
+
+                try
+                {
+                    var dataFile = Path.Combine(_dataDirectory, $"{SanitizeFileName(name)}.json");
+                    if (File.Exists(dataFile))
+                        File.Delete(dataFile);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error deleting stopwatch file: {ex.Message}");
+                }
+            }
+            return false;
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+        }
+
+        public void Dispose()
+        {
+            foreach (var stopwatch in _stopwatches.Values)
+            {
+                stopwatch.Dispose();
+            }
+        }
+    }
+
+    // Main GUI Form
+    public partial class MainForm : Form
+    {
+        private StopwatchManager _manager;
+        private PersistentStopwatch? _currentStopwatch;
+        private System.Windows.Forms.Timer _uiTimer;
+        private bool _sidebarExpanded = true;
+        private int _sidebarUpdateCounter = 0;
+
+        // Controls
+        private ComboBox _stopwatchCombo = null!;
+        private Button _newButton = null!;
+        private Button _deleteButton = null!;
+        private Label _timeLabel = null!;
+        private Button _startButton = null!;
+        private Button _stopButton = null!;
+        private Button _resetButton = null!;
+        private Button _lapButton = null!;
+        private ListBox _lapsList = null!;
+        private TextBox _lapNoteText = null!;
+        
+        // Sidebar controls
+        private Button _toggleSidebarButton = null!;
+        private Panel _sidebarPanel = null!;
+        private ListView _allStopwatchesList = null!;
+        private Label _sidebarTitle = null!;
+
+        public MainForm()
+        {
+            InitializeComponent();
+            _manager = new StopwatchManager();
+            
+            // UI update timer (low frequency for efficiency)
+            _uiTimer = new System.Windows.Forms.Timer();
+            _uiTimer.Interval = 100;
+            _uiTimer.Tick += UiTimer_Tick;
+            _uiTimer.Start();
+
+            LoadStopwatches();
+            UpdateSidebar();
+        }
+
+        private void InitializeComponent()
+        {
+            SuspendLayout();
+
+            // Form settings
+            Text = "Stopwatch Tracker";
+            Size = new Size(700, 400); // Wider to accommodate sidebar
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            // Sidebar toggle button
+            _toggleSidebarButton = new Button 
+            { 
+                Text = "◀", 
+                Location = new Point(305, 12), 
+                Size = new Size(25, 25),
+                Font = new Font("Arial", 8, FontStyle.Bold)
+            };
+            _toggleSidebarButton.Click += ToggleSidebarButton_Click;
+
+            // Sidebar panel
+            _sidebarPanel = new Panel 
+            { 
+                Location = new Point(335, 0), 
+                Size = new Size(380, 400),
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = Color.FromArgb(248, 248, 248)
+            };
+
+            _sidebarTitle = new Label 
+            { 
+                Text = "All Stopwatches", 
+                Location = new Point(10, 10), 
+                Size = new Size(280, 20),
+                Font = new Font("Arial", 9, FontStyle.Bold)
+            };
+
+            _allStopwatchesList = new ListView 
+            { 
+                Location = new Point(10, 35), 
+                Size = new Size(330, 350),
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                Font = new Font("Consolas", 8)
+            };
+            
+            // Setup ListView columns
+            _allStopwatchesList.Columns.Add("Name", 100);
+            _allStopwatchesList.Columns.Add("Duration", 80);
+            _allStopwatchesList.Columns.Add("Status", 60);
+            _allStopwatchesList.Columns.Add("Last Used", 80);
+            _allStopwatchesList.ItemActivate += AllStopwatchesList_ItemActivate;
+
+            // Add sidebar controls
+            _sidebarPanel.Controls.AddRange(new Control[] { _sidebarTitle, _allStopwatchesList });
+
+            // Stopwatch selection (adjusted positions for sidebar)
+            var lblSelect = new Label { Text = "Stopwatch:", Location = new Point(10, 15), Size = new Size(70, 20) };
+            _stopwatchCombo = new ComboBox { Location = new Point(85, 12), Size = new Size(120, 25), DropDownStyle = ComboBoxStyle.DropDownList };
+            _stopwatchCombo.SelectedIndexChanged += StopwatchCombo_SelectedIndexChanged;
+            
+            _newButton = new Button { Text = "New", Location = new Point(215, 12), Size = new Size(35, 25) };
+            _newButton.Click += NewButton_Click;
+            
+            _deleteButton = new Button { Text = "Del", Location = new Point(255, 12), Size = new Size(35, 25) };
+            _deleteButton.Click += DeleteButton_Click;
+
+            // Time display
+            _timeLabel = new Label 
+            { 
+                Text = "00:00:00.000", 
+                Location = new Point(10, 50), 
+                Size = new Size(310, 30),
+                Font = new Font("Consolas", 16, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleCenter,
+                BorderStyle = BorderStyle.Fixed3D
+            };
+
+            // Control buttons
+            _startButton = new Button { Text = "Start", Location = new Point(10, 90), Size = new Size(60, 30) };
+            _startButton.Click += StartButton_Click;
+            
+            _stopButton = new Button { Text = "Stop", Location = new Point(80, 90), Size = new Size(60, 30) };
+            _stopButton.Click += StopButton_Click;
+            
+            _resetButton = new Button { Text = "Reset", Location = new Point(150, 90), Size = new Size(60, 30) };
+            _resetButton.Click += ResetButton_Click;
+            
+            _lapButton = new Button { Text = "Lap", Location = new Point(220, 90), Size = new Size(60, 30) };
+            _lapButton.Click += LapButton_Click;
+
+            // Lap note input
+            var lblNote = new Label { Text = "Note:", Location = new Point(10, 135), Size = new Size(35, 20) };
+            _lapNoteText = new TextBox { Location = new Point(50, 132), Size = new Size(270, 25) };
+
+            // Laps list
+            var lblLaps = new Label { Text = "Laps:", Location = new Point(10, 170), Size = new Size(40, 20) };
+            _lapsList = new ListBox 
+            { 
+                Location = new Point(10, 190), 
+                Size = new Size(310, 160),
+                Font = new Font("Consolas", 9)
+            };
+
+            // Add main controls
+            Controls.AddRange(new Control[] {
+                lblSelect, _stopwatchCombo, _newButton, _deleteButton, _toggleSidebarButton,
+                _timeLabel, _startButton, _stopButton, _resetButton, _lapButton,
+                lblNote, _lapNoteText, lblLaps, _lapsList, _sidebarPanel
+            });
+
+            ResumeLayout();
+        }
+        
+        private void ToggleSidebarButton_Click(object sender, EventArgs e)
+        {
+            _sidebarExpanded = !_sidebarExpanded;
+            
+            if (_sidebarExpanded)
+            {
+                // Show sidebar
+                Size = new Size(700, 400);
+                _sidebarPanel.Visible = true;
+                _toggleSidebarButton.Text = "◀";
+                _toggleSidebarButton.Location = new Point(305, 12);
+            }
+            else
+            {
+                // Hide sidebar
+                Size = new Size(380, 400);
+                _sidebarPanel.Visible = false;
+                _toggleSidebarButton.Text = "▶";
+                _toggleSidebarButton.Location = new Point(295, 12);
+            }
+        }
+
+        private void AllStopwatchesList_ItemActivate(object sender, EventArgs e)
+        {
+            if (_allStopwatchesList.SelectedItems.Count == 0) return;
+
+            var selectedName = _allStopwatchesList.SelectedItems[0].Text;
+            var stopwatch = _manager.GetStopwatch(selectedName);
+            if (stopwatch == null) return;
+
+            // set current stopwatch and update the UI immediately
+            _currentStopwatch = stopwatch;
+            UpdateUI();
+            UpdateLapsList();
+
+            // also sync the combobox (only if it contains the item)
+            for (int i = 0; i < _stopwatchCombo.Items.Count; i++)
+            {
+                if (_stopwatchCombo.Items[i]?.ToString() == selectedName)
+                {
+                    _stopwatchCombo.SelectedIndex = i;
+                    break;
+                }
+            }
+        }
+
+        private void UpdateSidebar()
+        {
+            if (!_sidebarExpanded) return;
+
+            _allStopwatchesList.BeginUpdate();
+            try
+            {
+                // remember selection so we can restore it
+                string? selectedName = null;
+                if (_allStopwatchesList.SelectedItems.Count > 0)
+                    selectedName = _allStopwatchesList.SelectedItems[0].Text;
+
+                // map existing items by name
+                var existing = _allStopwatchesList.Items
+                    .Cast<ListViewItem>()
+                    .ToDictionary(i => i.Text, i => i);
+
+                var seen = new HashSet<string>();
+
+                foreach (var stopwatch in _manager.Stopwatches.OrderBy(s => s.Name))
+                {
+                    seen.Add(stopwatch.Name);
+
+                    if (!existing.TryGetValue(stopwatch.Name, out var item))
+                    {
+                        // create item with required subitems
+                        item = new ListViewItem(stopwatch.Name);
+                        item.SubItems.Add(""); // Duration
+                        item.SubItems.Add(""); // Status
+                        item.SubItems.Add(""); // Last Used
+                        _allStopwatchesList.Items.Add(item);
+                    }
+
+                    // Update subitems in-place
+                    var elapsed = stopwatch.Elapsed;
+                    item.SubItems[1].Text = $"{elapsed:hh\\:mm\\:ss}";
+                    item.SubItems[2].Text = stopwatch.IsRunning ? "RUNNING" : "STOPPED";
+
+                    var timeAgo = DateTime.Now - stopwatch.LastUsed;
+                    string timeAgoText;
+                    if (timeAgo.TotalMinutes < 1)
+                        timeAgoText = "Now";
+                    else if (timeAgo.TotalHours < 1)
+                        timeAgoText = $"{(int)timeAgo.TotalMinutes}m ago";
+                    else if (timeAgo.TotalDays < 1)
+                        timeAgoText = $"{(int)timeAgo.TotalHours}h ago";
+                    else
+                        timeAgoText = $"{(int)timeAgo.TotalDays}d ago";
+
+                    item.SubItems[3].Text = timeAgoText;
+
+                    // Colors: prefer highlighting selected stopwatch above running state
+                    if (_currentStopwatch?.Name == stopwatch.Name)
+                        item.BackColor = Color.LightBlue;
+                    else if (stopwatch.IsRunning)
+                        item.BackColor = Color.LightGreen;
+                    else
+                        item.BackColor = Color.White;
+                }
+
+                // Remove items that no longer exist
+                for (int i = _allStopwatchesList.Items.Count - 1; i >= 0; i--)
+                {
+                    var it = _allStopwatchesList.Items[i];
+                    if (!seen.Contains(it.Text))
+                        _allStopwatchesList.Items.RemoveAt(i);
+                }
+
+                // restore selection if still present
+                if (!string.IsNullOrEmpty(selectedName))
+                {
+                    var restore = _allStopwatchesList.Items.Cast<ListViewItem>().FirstOrDefault(x => x.Text == selectedName);
+                    if (restore != null)
+                        restore.Selected = true;
+                }
+            }
+            finally
+            {
+                _allStopwatchesList.EndUpdate();
+            }
+        }
+
+        private void LoadStopwatches()
+        {
+            _stopwatchCombo.Items.Clear();
+            foreach (var sw in _manager.Stopwatches.OrderBy(s => s.Name))
+            {
+                _stopwatchCombo.Items.Add(sw.Name);
+            }
+
+            if (_stopwatchCombo.Items.Count > 0 && _currentStopwatch == null)
+            {
+                _stopwatchCombo.SelectedIndex = 0;
+            }
+            else if (_currentStopwatch != null)
+            {
+                _stopwatchCombo.SelectedItem = _currentStopwatch.Name;
+            }
+
+            UpdateUI();
+            UpdateSidebar();
+        }
+
+        private void StopwatchCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (_stopwatchCombo.SelectedItem != null)
+            {
+                _currentStopwatch = _manager.GetStopwatch(_stopwatchCombo.SelectedItem.ToString()!);
+                UpdateUI();
+                UpdateLapsList();
+            }
+        }
+
+        private void NewButton_Click(object sender, EventArgs e)
+        {
+            using var dialog = new InputDialog("Enter stopwatch name:");
+            if (dialog.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.InputText))
+            {
+                try
+                {
+                    var stopwatch = _manager.CreateStopwatch(dialog.InputText);
+                    LoadStopwatches();
+                    UpdateSidebar();
+                    _stopwatchCombo.SelectedItem = stopwatch.Name;
+                }
+                catch (ArgumentException ex)
+                {
+                    MessageBox.Show(ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        private void DeleteButton_Click(object sender, EventArgs e)
+        {
+            if (_currentStopwatch != null)
+            {
+                var result = MessageBox.Show($"Delete '{_currentStopwatch.Name}'?", "Confirm", 
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                
+                if (result == DialogResult.Yes)
+                {
+                    _manager.DeleteStopwatch(_currentStopwatch.Name);
+                    _currentStopwatch = null;
+                    LoadStopwatches();
+                    UpdateSidebar();
+                }
+            }
+        }
+
+        private void StartButton_Click(object sender, EventArgs e)
+        {
+            _currentStopwatch?.Start();
+            UpdateUI();
+        }
+
+        private void StopButton_Click(object sender, EventArgs e)
+        {
+            _currentStopwatch?.Stop();
+            UpdateUI();
+        }
+
+        private void ResetButton_Click(object sender, EventArgs e)
+        {
+            _currentStopwatch?.Reset();
+            UpdateUI();
+            UpdateLapsList();
+        }
+
+        private void LapButton_Click(object sender, EventArgs e)
+        {
+            if (_currentStopwatch != null)
+            {
+                _currentStopwatch.AddLap(_lapNoteText.Text.Trim());
+                _lapNoteText.Clear();
+                UpdateLapsList();
+            }
+        }
+
+        private void UiTimer_Tick(object sender, EventArgs e)
+        {
+            if (_currentStopwatch?.IsRunning == true)
+            {
+                UpdateTimeDisplay();
+            }
+
+            // update sidebar less frequently to avoid interfering with clicks
+            _sidebarUpdateCounter++;
+            if (_sidebarUpdateCounter >= 5) // 5 * 100ms = 500ms
+            {
+                _sidebarUpdateCounter = 0;
+                UpdateSidebar();
+            }
+        }
+        private void UpdateUI()
+        {
+            var hasStopwatch = _currentStopwatch != null;
+            var isRunning = _currentStopwatch?.IsRunning == true;
+
+            _startButton.Enabled = hasStopwatch && !isRunning;
+            _stopButton.Enabled = hasStopwatch && isRunning;
+            _resetButton.Enabled = hasStopwatch;
+            _lapButton.Enabled = hasStopwatch;
+            _lapNoteText.Enabled = hasStopwatch;
+            _deleteButton.Enabled = hasStopwatch;
+
+            UpdateTimeDisplay();
+        }
+
+        private void UpdateTimeDisplay()
+        {
+            if (_currentStopwatch != null)
+            {
+                var elapsed = _currentStopwatch.Elapsed;
+                _timeLabel.Text = $"{elapsed:hh\\:mm\\:ss\\.fff}";
+                _timeLabel.ForeColor = _currentStopwatch.IsRunning ? Color.Green : Color.Black;
+            }
+            else
+            {
+                _timeLabel.Text = "00:00:00.000";
+                _timeLabel.ForeColor = Color.Gray;
+            }
+        }
+
+        private void UpdateLapsList()
+        {
+            _lapsList.Items.Clear();
+            if (_currentStopwatch?.Laps.Any() == true)
+            {
+                foreach (var lap in _currentStopwatch.Laps)
+                {
+                    var elapsed = new TimeSpan(lap.ElapsedTicks);
+                    var item = $"{elapsed:hh\\:mm\\:ss} - {lap.Timestamp:HH:mm:ss}";
+                    if (!string.IsNullOrWhiteSpace(lap.Note))
+                        item += $" ({lap.Note})";
+                    _lapsList.Items.Add(item);
+                }
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            _uiTimer?.Stop();
+            _manager?.Dispose();
+            base.OnFormClosing(e);
+        }
+    }
+
+    // Simple input dialog
+    public partial class InputDialog : Form
+    {
+        public string InputText => _textBox.Text;
+        private TextBox _textBox;
+
+        public InputDialog(string prompt)
+        {
+            InitializeComponent(prompt);
+        }
+
+        private void InitializeComponent(string prompt)
+        {
+            Text = "Input";
+            Size = new Size(300, 140);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            var label = new Label { Text = prompt, Location = new Point(10, 15), Size = new Size(270, 20) };
+            _textBox = new TextBox { Location = new Point(10, 40), Size = new Size(270, 25) };
+            
+            var okButton = new Button 
+            { 
+                Text = "OK", 
+                Location = new Point(125, 75), 
+                Size = new Size(75, 25),
+                DialogResult = DialogResult.OK
+            };
+            
+            var cancelButton = new Button 
+            { 
+                Text = "Cancel", 
+                Location = new Point(205, 75), 
+                Size = new Size(75, 25),
+                DialogResult = DialogResult.Cancel
+            };
+
+            AcceptButton = okButton;
+            CancelButton = cancelButton;
+
+            Controls.AddRange(new Control[] { label, _textBox, okButton, cancelButton });
+        }
+    }
+
+    // Program entry point
+    static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+}

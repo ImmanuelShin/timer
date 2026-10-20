@@ -1,0 +1,8 @@
+bin/
+obj/
+.vs/
+*.user
+
+# Saved timer data
+MultiTimerApp/timers.json
+MultiTimerApp/TimerData/
